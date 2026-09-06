@@ -1,0 +1,161 @@
+// Prisma schema for the ReachInbox email scheduler.
+// PostgreSQL is the source of truth for all entities.
+// Elasticsearch mirrors a subset of Email fields for search only.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EmailStatus {
+  SCHEDULED
+  PROCESSING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+model User {
+  id         String   @id @default(uuid())
+  googleId   String   @unique
+  name       String
+  email      String   @unique
+  avatarUrl  String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  senders            EmailSender[]
+  emails             Email[]
+  batches            Batch[]
+  idempotencyRecords IdempotencyRecord[]
+  slackConnection    SlackConnection?
+
+  @@index([email])
+}
+
+model EmailSender {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name         String
+  email        String
+  smtpHost     String
+  smtpPort     Int
+  smtpUser     String
+  smtpPassword String
+
+  // Per-sender overrides. Fall back to global env defaults when null.
+  hourlyLimit  Int?
+  minDelayMs   Int?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  emails       Email[]
+  batches      Batch[]
+
+  @@index([userId])
+}
+
+model Batch {
+  id                   String      @id @default(uuid())
+  userId               String
+  user                 User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  senderId             String
+  sender               EmailSender @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  delayBetweenEmailsMs Int?
+  hourlyLimit          Int?
+  startTime            DateTime
+
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+
+  emails               Email[]
+
+  @@index([userId])
+  @@index([senderId])
+}
+
+model Email {
+  id                 String      @id @default(uuid())
+  userId             String
+  user               User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  senderId           String
+  sender             EmailSender @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  // batchId groups every recipient created from the same "Compose" submission
+  // (e.g. one CSV upload). Each recipient still gets its own row + job.
+  batchId            String
+  batch              Batch?      @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  recipient          String
+  subject            String
+  body               String      @db.Text
+
+  status             EmailStatus @default(SCHEDULED)
+
+  scheduledAt        DateTime
+  sentAt             DateTime?
+  failedAt           DateTime?
+
+  attempts           Int         @default(0)
+
+  // Per-batch overrides from Compose modal (H1). Fall back to sender defaults if null.
+  minDelayMs         Int?
+  hourlyLimit        Int?
+
+  // BullMQ job id currently associated with this email. Updated whenever the
+  // job is rescheduled (e.g. after hitting the hourly rate limit), so a stale
+  // job can never resurrect an email that has already moved on.
+  bullJobId          String?
+
+  providerMessageId  String?
+  previewUrl         String?
+  errorMessage       String?
+  lastError          String?
+
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  @@unique([senderId, recipient, batchId], name: "uniq_sender_recipient_batch")
+  @@index([status])
+  @@index([scheduledAt])
+  @@index([senderId, status])
+  @@index([userId, status])
+  @@index([batchId])
+}
+
+model IdempotencyRecord {
+  id             String   @id @default(uuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key            String
+  responseStatus Int
+  responseBody   String   @db.Text
+  createdAt      DateTime @default(now())
+
+  @@unique([userId, key], name: "uniq_user_idempotency_key")
+  @@index([userId, key])
+}
+
+model SlackConnection {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  accessToken  String
+  teamId       String
+  teamName     String
+  slackUserId  String
+  channelId    String?
+  active       Boolean  @default(true)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
